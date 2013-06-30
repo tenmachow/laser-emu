@@ -1,0 +1,1 @@
+emulate a laser device
