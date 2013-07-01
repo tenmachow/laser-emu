@@ -351,6 +351,7 @@ unsigned int GenerateSimpleData(TimerPtr timer, unsigned int millis, void *arg)
 int parse_cmd(char *buf, size_t len, int fd)
 {
 	char *p, *q, *end;
+	int ret = 0;
 
 	p = buf;
 	end = buf + len;
@@ -376,10 +377,13 @@ int parse_cmd(char *buf, size_t len, int fd)
 				TimerCancel(simpleTimer);
 			}
 			*q = '\r';
+		} else {
+			ret = q - q;
+			break;
 		}
 		p = q;
 	}
-	return 0;
+	return ret;
 }
 
 void ptmx_read(int fd, void *closure, void *arg)
@@ -399,8 +403,8 @@ void ptmx_read(int fd, void *closure, void *arg)
 		ret = parse_cmd(pb->buf, pb->length, fd);
 		if (ret > 0) {
 			memcpy(pb->buf, &(pb->buf[pb->length - ret]), ret);
-			pb->length = ret;
 		}
+		pb->length = ret;
 	}
 }
 
