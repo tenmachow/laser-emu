@@ -5,8 +5,37 @@
 #include <termios.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 
 #include "laser_cmd.h"
+
+typedef struct _TimerRec *TimerPtr;
+typedef unsigned int (*TimerCallback)(TimerPtr /* timer */, 
+									unsigned int /*time */, 
+									void * /* arg */);
+
+struct _TimerRec {
+	TimerPtr next;
+	unsigned int expires;
+	unsigned int delta;
+	TimerCallback callback;
+	void *arg;
+};
+
+#define MILLI_PER_SECOND (1000)
+
+#define TimerAbsolute (1<<0)
+#define TimerForceOld (1<<1)
+
+TimerPtr TimerSet(TimerPtr timer, int flags, unsigned int millis,
+         TimerCallback func, void *arg);
+int TimerForce(TimerPtr timer);
+void TimerCancel(TimerPtr timer);
+void TimerFree(TimerPtr timer);
+void TimerCheck(void);
+void TimerInit(void);
+
+static TimerPtr timers;
 
 typedef void (*ReadFunc_t)(int, void *closure, void *arg);
 
@@ -94,18 +123,212 @@ int handleEvent(fd_set *set, int n)
 	return 0;
 }
 
+/*--- timer ---*/
+
+/* If time has rewound, re-run every affected timer.
+ * Timers might drop out of the list, so we have to restart every time. */
+static unsigned int GetTimeInMillis(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+
+	return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+}
+static void
+CheckAllTimers(void)
+{
+    TimerPtr timer;
+    unsigned int now;
+
+ start:
+    now = GetTimeInMillis();
+
+    for (timer = timers; timer; timer = timer->next) {
+        if (timer->expires - now > timer->delta + 250) {
+            TimerForce(timer);
+            goto start;
+        }
+    }
+}
+
+
+static void
+DoTimer(TimerPtr timer, unsigned int now, TimerPtr *prev)
+{
+    unsigned int newTime;
+
+    *prev = timer->next;
+    timer->next = NULL;
+    newTime = (*timer->callback) (timer, now, timer->arg);
+    if (newTime)
+        TimerSet(timer, 0, newTime, timer->callback, timer->arg);
+}
+
+
+TimerPtr TimerSet(TimerPtr timer, int flags, unsigned int millis, 
+		TimerCallback func, void *arg)
+{
+	TimerPtr *prev;
+	unsigned int now = GetTimeInMillis();
+
+	if (!timer) {
+		timer = malloc(sizeof(struct _TimerRec));
+		if (!timer)
+			return NULL;
+	 } else {
+	 	for (prev = &timers; *prev; prev = &(*prev)->next) {
+			if (*prev == timer) {
+				*prev = timer->next;
+				if (flags & TimerForceOld)
+					(void)(*timer->callback)(timer, now, timer->arg);
+				break;
+			}
+		}
+	 }
+	if (!millis)
+		return timer;
+	if (flags & TimerAbsolute) {
+		timer->delta = millis - now;
+	} else {
+		timer->delta = millis;
+		millis += now;
+	}
+	timer->expires = millis;
+	timer->callback = func;
+	timer->arg = arg;
+    if ((int) (millis - now) <= 0) {
+        timer->next = NULL;
+        millis = (*timer->callback) (timer, now, timer->arg);
+        if (!millis)
+            return timer;
+    }
+    for (prev = &timers;
+         *prev && (int) ((*prev)->expires - millis) <= 0;
+         prev = &(*prev)->next);
+    timer->next = *prev;
+    *prev = timer;
+    return timer;
+}
+
+int TimerForce(TimerPtr timer)
+{
+	int rc = -1;
+	TimerPtr *prev;
+
+	for (prev = &timers; *prev; prev = &(*prev)->next) {
+		if (*prev == timer) {
+			DoTimer(timer, GetTimeInMillis(), prev);
+			rc = 0;
+			break;
+		}
+	}
+	return rc;
+}
+
+void TimerCancel(TimerPtr timer)
+{
+	TimerPtr *prev;
+
+	if (!timer)
+		return;
+	for (prev = &timers; *prev; prev = &(*prev)->next) {
+		if (*prev == timer) {
+			*prev = timer->next;
+			break;
+		}
+	}
+}
+
+void TimerFree(TimerPtr timer)
+{
+	if (!timer)
+		return;
+	TimerCancel(timer);
+	free(timer);
+}
+
+void TimerCheck(void)
+{
+	unsigned int now = GetTimeInMillis();
+
+	while (timers && (int)(timers->expires - now) <= 0)
+		DoTimer(timers, now, &timers);
+}
+
+void TimerInit(void)
+{
+	TimerPtr timer;
+
+	while ((timer = timers)) {
+		timers = timers->next;
+		free(timer);
+	}
+}
+
 void dispatch(void)
 {
-	int ret;
+	int ret, i;
+	struct timeval *wt, waittime;
+	int timeout;
+	unsigned int now;
 	fd_set dump_rfds;
 	while (1) {
 		/* this can do some work queue job */
 
+		/* check timer list */
+		wt = NULL;
+		if (timers) {
+			now = GetTimeInMillis();
+			timeout = timers->expires - now;
+			if (timeout > 0 && timeout > timers->delta + 250) {
+				/* time has rewound. reset the timers. */
+				CheckAllTimers();
+			}
+
+			if (timers) {
+				timeout = timers->expires - now;
+				if (timeout < 0) 
+					timeout = 0;
+				waittime.tv_sec = timeout / MILLI_PER_SECOND;
+				waittime.tv_usec = (timeout % MILLI_PER_SECOND) * (1000000 / MILLI_PER_SECOND);
+				wt = &waittime;
+			}
+		}
 		/* prepare read fd set */
-		memcpy(&dump_rfds, &rfds, sizeof(rfds));
-		ret = select(maxfds, &dump_rfds, NULL, NULL, NULL);
-		if (ret > 0)
+		FD_ZERO(&dump_rfds);
+		//memcpy(&dump_rfds, &rfds, sizeof(rfds));
+		for (i = 0; i < MAX_EVENT_SET; i++) {
+			if (!gInputEventSet[i])
+				continue;
+			if (maxfds < gInputEventSet[i]->fd)
+				maxfds = gInputEventSet[i]->fd;
+			FD_SET(gInputEventSet[i]->fd, &dump_rfds);
+		}
+		ret = select(maxfds+1, &dump_rfds, NULL, NULL, wt);
+		if (ret <= 0) { 	/* An error or timeout occurred */
+			if (ret < 0) {
+				return;
+			}
+			if (timers) {
+				int expired = 0;
+				now = GetTimeInMillis();
+				if ((int)(timers->expires - now) <= 0)
+					expired = 1;
+
+				while (timers && (int)(timers->expires - now) <= 0)
+					DoTimer(timers, now, &timers);
+			}
+		
+		} else {
 			handleEvent(&dump_rfds, ret);
+
+			if (timers) {
+				now = GetTimeInMillis();
+				while (timers && (int)(timers->expires - now) <= 0)
+					DoTimer(timers, now, &timers);
+			}
+		}
 	}
 }
 
@@ -115,7 +338,17 @@ typedef struct {
 	size_t capacity;
 } BufferRec, *BufferPtr;
 
-int parse_cmd(char *buf, size_t len)
+static TimerPtr simpleTimer;
+
+unsigned int GenerateSimpleData(TimerPtr timer, unsigned int millis, void *arg)
+{
+	int fd = (int)arg;
+
+	write(fd, "1022.8\r\n", 8);
+	return timer->delta;
+}
+
+int parse_cmd(char *buf, size_t len, int fd)
 {
 	char *p, *q, *end;
 
@@ -125,10 +358,24 @@ int parse_cmd(char *buf, size_t len)
 		/* skip blank line */
 		while (*p == '\r' || *p == '\n') p++;
 		q = p;
-		while (*q ! = '\r' && q != end) q++;
+		while ((*q != '\r') && (q != end)) q++;
 
 		if (q != end) {
 			/* get a line */
+			*q = 0;
+			if (strcmp(p, "LO") == 0) {
+				write(fd, "LO\r\n", 4);
+				TimerCancel(simpleTimer);
+			} else if (strcmp(p, "LF") == 0) {
+				write(fd, "LF\r\n", 4);
+				TimerCancel(simpleTimer);
+			} else if (strcmp(p, "DX") == 0) {
+				simpleTimer = TimerSet(simpleTimer, 0, 50, GenerateSimpleData, (void *)fd);
+			} else {
+				write(fd, "E404\r\n", 6);
+				TimerCancel(simpleTimer);
+			}
+			*q = '\r';
 		}
 		p = q;
 	}
@@ -149,7 +396,7 @@ void ptmx_read(int fd, void *closure, void *arg)
 				return;
 		}
 		pb->length += ret;
-		ret = parse_cmd(pb->buf, pb->length);
+		ret = parse_cmd(pb->buf, pb->length, fd);
 		if (ret > 0) {
 			memcpy(pb->buf, &(pb->buf[pb->length - ret]), ret);
 			pb->length = ret;
@@ -160,15 +407,30 @@ void ptmx_read(int fd, void *closure, void *arg)
 int main()
 {
 	int fd, ret;
+	char *pts;
 	char buf[BUFSIZ];
 	size_t length = 0, bufsiz = BUFSIZ;
 	BufferRec ptmxBuf;
 
 	fd = open("/dev/ptmx",O_RDWR);
 
-	grantpt(fd);
-	unlockpt(fd);
-	printf("ptsname: %s\n", ptsname(fd));
+	if (grantpt(fd)) {
+		fprintf(stderr, "grantpt failed: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+	if (unlockpt(fd)) {
+		fprintf(stderr, "unlockpt failed: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+	ret = ptsname_r(fd, buf, sizeof(buf));
+	if (ret) {
+		fprintf(stderr, "ptsname failed: %s\n", strerror(errno));
+		close(fd);
+		exit(1);
+	}
+	printf("%s\n", buf);
 
 	ptmxBuf.buf = buf;
 	ptmxBuf.length = 0;
@@ -176,6 +438,8 @@ int main()
 	registerFD(fd, ptmx_read, &ptmxBuf);
 
 	dispatch();
+
+	close(fd);
 
 	return 0;
 }
